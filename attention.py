@@ -5,6 +5,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Try to import Triton-optimized LSR (optional)
+try:
+    from lsr_triton import lsr_attention_triton_autograd
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
+
 
 def scaled_dot_product_attention(q, k, v, causal=True):
     """
@@ -75,13 +82,13 @@ def lsr_attention(q, k, v, W_q, W_k, causal=True):
 
 class MultiHeadSelfAttention(nn.Module):
     """
-    Multi-head self-attention with support for both standard and LSR attention.
+    Multi-head self-attention with support for standard, LSR, and Triton-optimized LSR attention.
     
     Args:
         d_model: model dimension
         num_heads: number of attention heads
-        attn_type: "dot" for scaled dot-product, "lsr" for low separation rank
-        lsr_rank: rank for LSR attention (only used if attn_type="lsr")
+        attn_type: "dot" for scaled dot-product, "lsr" for LSR, "lsr_triton" for Triton-optimized LSR
+        lsr_rank: rank for LSR attention (only used if attn_type in ["lsr", "lsr_triton"])
     """
     
     def __init__(self, d_model, num_heads, attn_type="dot", lsr_rank=32):
@@ -99,7 +106,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
 
-        if attn_type == "lsr":
+        if attn_type in ("lsr", "lsr_triton"):
             self.W_q_lsr = nn.Parameter(
                 torch.randn(num_heads, self.d_head, lsr_rank) / math.sqrt(self.d_head)
             )
@@ -126,7 +133,11 @@ class MultiHeadSelfAttention(nn.Module):
         v = self.v_proj(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
 
         # Apply attention
-        if self.attn_type == "lsr":
+        if self.attn_type == "lsr_triton":
+            if not TRITON_AVAILABLE:
+                raise RuntimeError("Triton not available. Use attn_type='lsr' instead.")
+            y = lsr_attention_triton_autograd(q, k, v, self.W_q_lsr, self.W_k_lsr, causal=True)
+        elif self.attn_type == "lsr":
             y = lsr_attention(q, k, v, self.W_q_lsr, self.W_k_lsr, causal=True)
         else:
             y = scaled_dot_product_attention(q, k, v, causal=True)

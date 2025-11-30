@@ -147,7 +147,7 @@ if __name__ == "__main__":
     
     # Attention
     parser.add_argument("--attn_type", type=str, default="lsr",
-                        choices=["dot", "lsr"], help="Attention type")
+                        choices=["dot", "lsr", "lsr_triton"], help="Attention type")
     parser.add_argument("--lsr_rank", type=int, default=32,
                         help="Rank for LSR attention")
 
