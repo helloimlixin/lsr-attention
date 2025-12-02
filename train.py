@@ -37,11 +37,10 @@ class Config:
     eval_interval: int = 500
     eval_batches: int = 50
     attn_type: str = "lsr"
-    lsr_rank: int = 32
+    lsr_rank: int = 8
     dataset_name: str = "wikitext-2-raw-v1"
     device: str = "cuda"
     seed: int = 0
-
 
 def evaluate(model, tokens, cfg: Config):
     """Evaluate model on validation set."""
@@ -54,7 +53,6 @@ def evaluate(model, tokens, cfg: Config):
             losses.append(loss.item())
     model.train()
     return sum(losses) / len(losses)
-
 
 def main(args):
     device = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
@@ -82,7 +80,7 @@ def main(args):
     print("Config:", cfg)
     print("Using device:", cfg.device)
     print("Loading dataset + tokenizer:", cfg.dataset_name)
-    
+
     tokenizer, train_ids, val_ids = load_wikitext(cfg.dataset_name)
     vocab_size = tokenizer.vocab_size
     train_ids = train_ids.to(cfg.device)
@@ -108,7 +106,7 @@ def main(args):
 
     print("Starting training...")
     t0 = time.time()
-    
+
     for step in range(1, cfg.steps + 1):
         x, y = make_batch(train_ids, cfg.batch_size, cfg.max_seq_len, cfg.device)
         _, loss = model(x, y)
@@ -135,7 +133,7 @@ def main(args):
     total_time = t1 - t0
     total_tokens = cfg.steps * tokens_per_step
     toks_per_sec = total_tokens / max(total_time, 1e-8)
-    
+
     print("Done.")
     print(f"Total train time: {total_time:.1f} s "
           f"| total tokens: {total_tokens} "
@@ -144,11 +142,12 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train GPT with LSR attention")
-    
+
     # Attention
     parser.add_argument("--attn_type", type=str, default="lsr",
-                        choices=["dot", "lsr", "lsr_triton"], help="Attention type")
-    parser.add_argument("--lsr_rank", type=int, default=32,
+                        choices=["dot", "lsr", "lsr_fused"],
+                        help="Attention type: 'dot' for standard, 'lsr' for Triton-optimized LSR, 'lsr_fused' for fused kernel")
+    parser.add_argument("--lsr_rank", type=int, default=4,
                         help="Rank for LSR attention")
 
     # Model architecture
@@ -157,18 +156,18 @@ if __name__ == "__main__":
     parser.add_argument("--num_layers", type=int, default=8)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--seq_len", type=int, default=1024)
-    
+
     # Training
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--eval_interval", type=int, default=500)
     parser.add_argument("--eval_batches", type=int, default=50)
     parser.add_argument("--lr", type=float, default=3e-4)
-    
+
     # Data
     parser.add_argument("--dataset", type=str, default="wikitext-2-raw-v1",
                         choices=["wikitext-2-raw-v1", "wikitext-103-raw-v1"])
-    
+
     # Misc
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--cpu", action="store_true")

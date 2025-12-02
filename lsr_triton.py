@@ -1,8 +1,4 @@
-"""
-Triton-optimized Low Separation Rank (LSR) Attention.
-
-Fuses the low-rank projection and attention computation into efficient CUDA kernels.
-"""
+"""Triton fused Low Separation Rank (LSR) attention."""
 
 import math
 import torch
@@ -12,343 +8,474 @@ import triton.language as tl
 
 
 # -----------------------------------------------------------------------------
-# Triton Kernels
+# Kernels
 # -----------------------------------------------------------------------------
 
 @triton.jit
-def lsr_scores_kernel(
-    Q_ptr, K_ptr, Wq_ptr, Wk_ptr, S_ptr,
+def lsr_fused_kernel(
+    Q_ptr, K_ptr, V_ptr, Wq_ptr, Wk_ptr, Core_ptr, O_ptr,
     T: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
     stride_q_bh, stride_q_t, stride_q_d,
     stride_k_bh, stride_k_t, stride_k_d,
+    stride_v_bh, stride_v_t, stride_v_d,
     stride_wq_h, stride_wq_d, stride_wq_r,
     stride_wk_h, stride_wk_d, stride_wk_r,
-    stride_s_bh, stride_s_i, stride_s_j,
+    stride_core_h, stride_core_r,
+    stride_o_bh, stride_o_t, stride_o_d,
     H: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_R: tl.constexpr,
-    ORIGINAL_R: tl.constexpr,  # Original rank for proper scaling
-):
-    """
-    Compute LSR attention scores: S[i,j] = sum_r (Q @ Wq)[i,r] * (K @ Wk)[j,r] / sqrt(R)
-    
-    Fuses the projection and score computation.
-    """
-    pid_m = tl.program_id(0)  # row block
-    pid_n = tl.program_id(1)  # col block
-    pid_bh = tl.program_id(2)  # batch * head
-    
-    # Extract head index for W lookup
-    h = pid_bh % H
-    
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_d = tl.arange(0, D)
-    offs_r = tl.arange(0, BLOCK_R)
-    
-    m_mask = offs_m < T
-    n_mask = offs_n < T
-    
-    # Load Q[bh, m, :] and K[bh, n, :]
-    q_ptrs = Q_ptr + pid_bh * stride_q_bh + offs_m[:, None] * stride_q_t + offs_d[None, :] * stride_q_d
-    k_ptrs = K_ptr + pid_bh * stride_k_bh + offs_n[:, None] * stride_k_t + offs_d[None, :] * stride_k_d
-    
-    Q_block = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)  # (BLOCK_M, D)
-    K_block = tl.load(k_ptrs, mask=n_mask[:, None], other=0.0)  # (BLOCK_N, D)
-    
-    # Accumulate scores over rank dimension (only iterate over ORIGINAL_R, padded dims are zeros)
-    scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    
-    for r_start in range(0, R, BLOCK_R):
-        r_offs = r_start + offs_r
-        r_mask = r_offs < ORIGINAL_R  # Use ORIGINAL_R to mask out padding
-        
-        # Load Wq[h, :, r] and Wk[h, :, r]
-        wq_ptrs = Wq_ptr + h * stride_wq_h + offs_d[:, None] * stride_wq_d + r_offs[None, :] * stride_wq_r
-        wk_ptrs = Wk_ptr + h * stride_wk_h + offs_d[:, None] * stride_wk_d + r_offs[None, :] * stride_wk_r
-        
-        Wq_block = tl.load(wq_ptrs, mask=r_mask[None, :], other=0.0)  # (D, BLOCK_R)
-        Wk_block = tl.load(wk_ptrs, mask=r_mask[None, :], other=0.0)  # (D, BLOCK_R)
-        
-        # Project: Q_lr = Q @ Wq, K_lr = K @ Wk
-        Q_lr = tl.dot(Q_block, Wq_block)  # (BLOCK_M, BLOCK_R)
-        K_lr = tl.dot(K_block, Wk_block)  # (BLOCK_N, BLOCK_R)
-        
-        # Score contribution: sum over this rank block
-        scores += tl.dot(Q_lr, tl.trans(K_lr))
-    
-    # Scale by 1/sqrt(ORIGINAL_R) - use original rank for proper scaling
-    scale = 1.0 / tl.sqrt(tl.cast(ORIGINAL_R, tl.float32))
-    scores = scores * scale
-    
-    # Store scores
-    s_ptrs = S_ptr + pid_bh * stride_s_bh + offs_m[:, None] * stride_s_i + offs_n[None, :] * stride_s_j
-    tl.store(s_ptrs, scores, mask=m_mask[:, None] & n_mask[None, :])
-
-
-@triton.jit
-def lsr_softmax_kernel(
-    S_ptr, P_ptr,
-    T: tl.constexpr,
-    stride_s_bh, stride_s_i, stride_s_j,
     CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ORIGINAL_R: tl.constexpr,
 ):
-    """Apply causal mask and row-wise softmax."""
+    """Fused forward kernel for a flat core of rank R."""
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
-    
+    h = pid_bh % H
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_r = tl.arange(0, BLOCK_R)
+
     m_mask = offs_m < T
-    
-    # Load full row for softmax
+    d_mask = offs_d < D
+    r_mask = offs_r < ORIGINAL_R
+
+    wq_ptrs = Wq_ptr + h * stride_wq_h + offs_d[:, None] * stride_wq_d + offs_r[None, :] * stride_wq_r
+    wk_ptrs = Wk_ptr + h * stride_wk_h + offs_d[:, None] * stride_wk_d + offs_r[None, :] * stride_wk_r
+    Wq_block = tl.load(wq_ptrs, mask=d_mask[:, None] & r_mask[None, :], other=0.0)
+    Wk_block = tl.load(wk_ptrs, mask=d_mask[:, None] & r_mask[None, :], other=0.0)
+
+    core_ptrs = Core_ptr + h * stride_core_h + offs_r * stride_core_r
+    core_block = tl.load(core_ptrs, mask=r_mask, other=0.0)
+
+    q_ptrs = Q_ptr + pid_bh * stride_q_bh + offs_m[:, None] * stride_q_t + offs_d[None, :] * stride_q_d
+    Q_block = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
+    Q_lr = tl.dot(Q_block, Wq_block)
+
+    scale = 1.0 / tl.sqrt(tl.cast(ORIGINAL_R, tl.float32))
+    Q_lr = Q_lr * core_block[None, :] * scale
+
+    if CAUSAL:
+        n_blocks = tl.minimum(tl.cdiv((pid_m + 1) * BLOCK_M, BLOCK_N), tl.cdiv(T, BLOCK_N))
+    else:
+        n_blocks = tl.cdiv(T, BLOCK_N)
+
     row_max = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
-    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
-    
-    # First pass: find max
-    for n_start in range(0, T, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
+
+    for n_block in range(n_blocks):
+        offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = offs_n < T
-        
-        s_ptrs = S_ptr + pid_bh * stride_s_bh + offs_m[:, None] * stride_s_i + offs_n[None, :] * stride_s_j
-        s_block = tl.load(s_ptrs, mask=m_mask[:, None] & n_mask[None, :], other=float("-inf"))
-        
+
+        k_ptrs = K_ptr + pid_bh * stride_k_bh + offs_n[:, None] * stride_k_t + offs_d[None, :] * stride_k_d
+        K_block = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+        K_lr = tl.dot(K_block, Wk_block)
+
+        scores = tl.dot(Q_lr, tl.trans(K_lr))
+
         if CAUSAL:
             causal_mask = offs_n[None, :] <= offs_m[:, None]
-            s_block = tl.where(causal_mask, s_block, float("-inf"))
-        
-        block_max = tl.max(s_block, axis=1)
+            scores = tl.where(causal_mask, scores, float("-inf"))
+        scores = tl.where(n_mask[None, :], scores, float("-inf"))
+
+        block_max = tl.max(scores, axis=1)
         row_max = tl.maximum(row_max, block_max)
-    
-    # Second pass: compute exp sum
-    for n_start in range(0, T, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
+
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    for n_block in range(n_blocks):
+        offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = offs_n < T
-        
-        s_ptrs = S_ptr + pid_bh * stride_s_bh + offs_m[:, None] * stride_s_i + offs_n[None, :] * stride_s_j
-        s_block = tl.load(s_ptrs, mask=m_mask[:, None] & n_mask[None, :], other=float("-inf"))
-        
+
+        k_ptrs = K_ptr + pid_bh * stride_k_bh + offs_n[:, None] * stride_k_t + offs_d[None, :] * stride_k_d
+        K_block = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+        K_lr = tl.dot(K_block, Wk_block)
+
+        scores = tl.dot(Q_lr, tl.trans(K_lr))
+
         if CAUSAL:
             causal_mask = offs_n[None, :] <= offs_m[:, None]
-            s_block = tl.where(causal_mask, s_block, float("-inf"))
-        
-        exp_block = tl.exp(s_block - row_max[:, None])
-        row_sum += tl.sum(exp_block, axis=1)
-    
-    # Third pass: normalize and store
-    for n_start in range(0, T, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
-        n_mask = offs_n < T
-        
-        s_ptrs = S_ptr + pid_bh * stride_s_bh + offs_m[:, None] * stride_s_i + offs_n[None, :] * stride_s_j
-        p_ptrs = P_ptr + pid_bh * stride_s_bh + offs_m[:, None] * stride_s_i + offs_n[None, :] * stride_s_j
-        
-        s_block = tl.load(s_ptrs, mask=m_mask[:, None] & n_mask[None, :], other=float("-inf"))
-        
-        if CAUSAL:
-            causal_mask = offs_n[None, :] <= offs_m[:, None]
-            s_block = tl.where(causal_mask, s_block, float("-inf"))
-        
-        p_block = tl.exp(s_block - row_max[:, None]) / row_sum[:, None]
-        p_block = tl.where(m_mask[:, None] & n_mask[None, :], p_block, 0.0)
-        
-        tl.store(p_ptrs, p_block, mask=m_mask[:, None] & n_mask[None, :])
+            scores = tl.where(causal_mask, scores, float("-inf"))
+        scores = tl.where(n_mask[None, :], scores, float("-inf"))
+
+        exp_scores = tl.exp(scores - row_max[:, None])
+        row_sum += tl.sum(exp_scores, axis=1)
+
+        v_ptrs = V_ptr + pid_bh * stride_v_bh + offs_n[:, None] * stride_v_t + offs_d[None, :] * stride_v_d
+        V_block = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+        acc += tl.dot(exp_scores.to(V_block.dtype), V_block)
+
+    acc = acc / row_sum[:, None]
+
+    o_ptrs = O_ptr + pid_bh * stride_o_bh + offs_m[:, None] * stride_o_t + offs_d[None, :] * stride_o_d
+    tl.store(o_ptrs, acc, mask=m_mask[:, None] & d_mask[None, :])
 
 
 @triton.jit
-def lsr_output_kernel(
-    P_ptr, V_ptr, O_ptr,
+def lsr_fused_kernel_factorized(
+    Q_ptr, K_ptr, V_ptr, Wq_ptr, Wk_ptr, Core1_ptr, Core2_ptr, O_ptr,
     T: tl.constexpr, D: tl.constexpr,
-    stride_p_bh, stride_p_i, stride_p_j,
+    R1: tl.constexpr, R2: tl.constexpr,
+    stride_q_bh, stride_q_t, stride_q_d,
+    stride_k_bh, stride_k_t, stride_k_d,
     stride_v_bh, stride_v_t, stride_v_d,
+    stride_wq_h, stride_wq_d, stride_wq_r,
+    stride_wk_h, stride_wk_d, stride_wk_r,
+    stride_core1_h, stride_core1_r,
+    stride_core2_h, stride_core2_r,
     stride_o_bh, stride_o_t, stride_o_d,
+    H: tl.constexpr,
+    CAUSAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_R2: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Compute output: O = P @ V"""
+    """Fused forward kernel for a two-factor Kronecker core core1⊗core2."""
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
-    
+    h = pid_bh % H
+
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_D)
+    offs_r2 = tl.arange(0, BLOCK_R2)
+
     m_mask = offs_m < T
     d_mask = offs_d < D
-    
-    # Accumulate output
-    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
-    
-    for n_start in range(0, T, BLOCK_N):
-        offs_n = n_start + tl.arange(0, BLOCK_N)
+    r2_mask = offs_r2 < R2
+
+    core1_ptrs = Core1_ptr + h * stride_core1_h + tl.arange(0, R1) * stride_core1_r
+    core1 = tl.load(core1_ptrs)
+    core2_ptrs = Core2_ptr + h * stride_core2_h + offs_r2 * stride_core2_r
+    core2 = tl.load(core2_ptrs, mask=r2_mask, other=0.0)
+
+    q_ptrs = Q_ptr + pid_bh * stride_q_bh + offs_m[:, None] * stride_q_t + offs_d[None, :] * stride_q_d
+    Q_block = tl.load(q_ptrs, mask=m_mask[:, None] & d_mask[None, :], other=0.0)
+
+    if CAUSAL:
+        n_blocks = tl.minimum(tl.cdiv((pid_m + 1) * BLOCK_M, BLOCK_N), tl.cdiv(T, BLOCK_N))
+    else:
+        n_blocks = tl.cdiv(T, BLOCK_N)
+
+    row_max = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+
+    for n_block in range(n_blocks):
+        offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
         n_mask = offs_n < T
-        
-        # Load P[m, n] and V[n, d]
-        p_ptrs = P_ptr + pid_bh * stride_p_bh + offs_m[:, None] * stride_p_i + offs_n[None, :] * stride_p_j
+
+        k_ptrs = K_ptr + pid_bh * stride_k_bh + offs_n[:, None] * stride_k_t + offs_d[None, :] * stride_k_d
+        K_block = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+        scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for r1 in range(R1):
+            wq_ptrs_r1 = Wq_ptr + h * stride_wq_h + offs_d[:, None] * stride_wq_d + (r1 * BLOCK_R2 + offs_r2[None, :]) * stride_wq_r
+            wk_ptrs_r1 = Wk_ptr + h * stride_wk_h + offs_d[:, None] * stride_wk_d + (r1 * BLOCK_R2 + offs_r2[None, :]) * stride_wk_r
+            Wq_block = tl.load(wq_ptrs_r1, mask=d_mask[:, None] & r2_mask[None, :], other=0.0)
+            Wk_block = tl.load(wk_ptrs_r1, mask=d_mask[:, None] & r2_mask[None, :], other=0.0)
+
+            q_lr = tl.dot(Q_block, Wq_block)
+            k_lr = tl.dot(K_block, Wk_block)
+            partial = tl.dot(q_lr * core2[None, :], tl.trans(k_lr))
+            scores += core1[r1] * partial
+
+        scale = 1.0 / tl.sqrt(tl.float32(R1 * R2))
+        scores = scores * scale
+
+        if CAUSAL:
+            causal_mask = offs_n[None, :] <= offs_m[:, None]
+            scores = tl.where(causal_mask, scores, float("-inf"))
+        scores = tl.where(n_mask[None, :], scores, float("-inf"))
+
+        block_max = tl.max(scores, axis=1)
+        row_max = tl.maximum(row_max, block_max)
+
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    for n_block in range(n_blocks):
+        offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = offs_n < T
+
+        k_ptrs = K_ptr + pid_bh * stride_k_bh + offs_n[:, None] * stride_k_t + offs_d[None, :] * stride_k_d
+        K_block = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
+
+        scores = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for r1 in range(R1):
+            wq_ptrs_r1 = Wq_ptr + h * stride_wq_h + offs_d[:, None] * stride_wq_d + (r1 * BLOCK_R2 + offs_r2[None, :]) * stride_wq_r
+            wk_ptrs_r1 = Wk_ptr + h * stride_wk_h + offs_d[:, None] * stride_wk_d + (r1 * BLOCK_R2 + offs_r2[None, :]) * stride_wk_r
+            Wq_block = tl.load(wq_ptrs_r1, mask=d_mask[:, None] & r2_mask[None, :], other=0.0)
+            Wk_block = tl.load(wk_ptrs_r1, mask=d_mask[:, None] & r2_mask[None, :], other=0.0)
+
+            q_lr = tl.dot(Q_block, Wq_block)
+            k_lr = tl.dot(K_block, Wk_block)
+            partial = tl.dot(q_lr * core2[None, :], tl.trans(k_lr))
+            scores += core1[r1] * partial
+
+        scale = 1.0 / tl.sqrt(tl.float32(R1 * R2))
+        scores = scores * scale
+
+        if CAUSAL:
+            causal_mask = offs_n[None, :] <= offs_m[:, None]
+            scores = tl.where(causal_mask, scores, float("-inf"))
+        scores = tl.where(n_mask[None, :], scores, float("-inf"))
+
+        exp_scores = tl.exp(scores - row_max[:, None])
+        row_sum += tl.sum(exp_scores, axis=1)
+
         v_ptrs = V_ptr + pid_bh * stride_v_bh + offs_n[:, None] * stride_v_t + offs_d[None, :] * stride_v_d
-        
-        P_block = tl.load(p_ptrs, mask=m_mask[:, None] & n_mask[None, :], other=0.0)
         V_block = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
-        
-        acc += tl.dot(P_block, V_block)
-    
-    # Store output
+        acc += tl.dot(exp_scores.to(V_block.dtype), V_block)
+
+    acc = acc / row_sum[:, None]
     o_ptrs = O_ptr + pid_bh * stride_o_bh + offs_m[:, None] * stride_o_t + offs_d[None, :] * stride_o_d
     tl.store(o_ptrs, acc, mask=m_mask[:, None] & d_mask[None, :])
 
 
 # -----------------------------------------------------------------------------
-# Python Wrappers
+# Python wrappers
 # -----------------------------------------------------------------------------
 
-def lsr_attention_triton(q, k, v, W_q, W_k, causal=True):
-    """
-    Triton-optimized LSR attention.
-    
-    Args:
-        q, k, v: (B, H, T, D)
-        W_q, W_k: (H, D, R)
-        causal: whether to apply causal masking
-    
-    Returns:
-        output: (B, H, T, D)
-    """
+def _run_fused(q, k, v, W_q, W_k, core, causal=True):
     B, H, T, D = q.shape
     R = W_q.shape[-1]
     BH = B * H
-    
-    # Triton requires K >= 16 for tl.dot, so pad R if needed
+
     R_padded = max(R, 16)
-    if R < 16:
-        pad_size = 16 - R
-        W_q = torch.nn.functional.pad(W_q, (0, pad_size), value=0.0)
-        W_k = torch.nn.functional.pad(W_k, (0, pad_size), value=0.0)
-    
-    # Flatten batch and head dimensions
+    if R_padded != R:
+        pad = R_padded - R
+        W_q = torch.nn.functional.pad(W_q, (0, pad), value=0.0)
+        W_k = torch.nn.functional.pad(W_k, (0, pad), value=0.0)
+        core = torch.nn.functional.pad(core, (0, pad), value=0.0)
+
     q_flat = q.reshape(BH, T, D).contiguous()
     k_flat = k.reshape(BH, T, D).contiguous()
     v_flat = v.reshape(BH, T, D).contiguous()
-    
-    # Allocate intermediates
-    S = torch.empty(BH, T, T, device=q.device, dtype=torch.float32)
-    P = torch.empty(BH, T, T, device=q.device, dtype=torch.float32)
+
     O = torch.empty(BH, T, D, device=q.device, dtype=torch.float32)
-    
-    # Kernel configs - use padded R for BLOCK_R
+
     BLOCK_M = min(64, T)
     BLOCK_N = min(64, T)
     BLOCK_R = min(32, R_padded)
     BLOCK_D = min(64, D)
-    
-    # Launch score kernel (use R_padded for dimensions, but original R for scaling)
-    grid_scores = (triton.cdiv(T, BLOCK_M), triton.cdiv(T, BLOCK_N), BH)
-    lsr_scores_kernel[grid_scores](
-        q_flat, k_flat, W_q.contiguous(), W_k.contiguous(), S,
-        T, D, R_padded,  # Use padded R for kernel dimensions
-        *q_flat.stride(), *k_flat.stride(),
+
+    grid = (triton.cdiv(T, BLOCK_M), BH)
+    lsr_fused_kernel[grid](
+        q_flat, k_flat, v_flat,
+        W_q.contiguous(), W_k.contiguous(), core.contiguous(),
+        O,
+        T, D, R_padded,
+        *q_flat.stride(), *k_flat.stride(), *v_flat.stride(),
         *W_q.stride(), *W_k.stride(),
-        *S.stride(),
+        *core.stride(),
+        *O.stride(),
         H,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_R=BLOCK_R,
-        ORIGINAL_R=R,  # Pass original R for proper scaling
-    )
-    
-    # Launch softmax kernel
-    grid_softmax = (triton.cdiv(T, BLOCK_M), BH)
-    lsr_softmax_kernel[grid_softmax](
-        S, P,
-        T,
-        *S.stride(),
         CAUSAL=causal,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_R=BLOCK_R, BLOCK_D=BLOCK_D,
+        ORIGINAL_R=R,
     )
-    
-    # Launch output kernel
-    grid_output = (triton.cdiv(T, BLOCK_M), BH)
-    lsr_output_kernel[grid_output](
-        P, v_flat, O,
+    return O.reshape(B, H, T, D).to(q.dtype)
+
+
+def _run_fused_factorized(q, k, v, W_q, W_k, core1, core2, causal=True):
+    B, H, T, D = q.shape
+    R1 = core1.shape[-1]
+    R2 = core2.shape[-1]
+    BH = B * H
+
+    BLOCK_R2 = min(32, triton.next_power_of_2(R2))
+    R2_padded = BLOCK_R2
+
+    if R2_padded != R2:
+        pad = R2_padded - R2
+        core2 = torch.nn.functional.pad(core2, (0, pad), value=0.0)
+        W_q = torch.nn.functional.pad(W_q, (0, pad * R1), value=0.0)
+        W_k = torch.nn.functional.pad(W_k, (0, pad * R1), value=0.0)
+
+    q_flat = q.reshape(BH, T, D).contiguous()
+    k_flat = k.reshape(BH, T, D).contiguous()
+    v_flat = v.reshape(BH, T, D).contiguous()
+
+    O = torch.empty(BH, T, D, device=q.device, dtype=torch.float32)
+
+    BLOCK_M = min(64, T)
+    BLOCK_N = min(64, T)
+    BLOCK_D = min(64, D)
+
+    grid = (triton.cdiv(T, BLOCK_M), BH)
+    lsr_fused_kernel_factorized[grid](
+        q_flat, k_flat, v_flat,
+        W_q.contiguous(), W_k.contiguous(),
+        core1.contiguous(), core2.contiguous(),
+        O,
         T, D,
-        *P.stride(), *v_flat.stride(), *O.stride(),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+        R1, R2_padded,
+        *q_flat.stride(), *k_flat.stride(), *v_flat.stride(),
+        *W_q.stride(), *W_k.stride(),
+        *core1.stride(), *core2.stride(),
+        *O.stride(),
+        H,
+        CAUSAL=causal,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_R2=BLOCK_R2, BLOCK_D=BLOCK_D,
     )
-    
     return O.reshape(B, H, T, D).to(q.dtype)
 
 
 # -----------------------------------------------------------------------------
-# Autograd Wrapper
+# Autograd
 # -----------------------------------------------------------------------------
 
-class LSRTritonFunction(torch.autograd.Function):
+class LsrTritonFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, W_q, W_k, causal):
-        out = lsr_attention_triton(q.float(), k.float(), v.float(), 
-                                    W_q.float(), W_k.float(), causal)
-        ctx.save_for_backward(q, k, v, W_q, W_k)
+    def forward(ctx, q, k, v, W_q, W_k, core, causal):
+        out = _run_fused(q.float(), k.float(), v.float(), W_q.float(), W_k.float(), core.float(), causal)
+        ctx.save_for_backward(q, k, v, W_q, W_k, core)
         ctx.causal = causal
         return out.to(q.dtype)
-    
+
     @staticmethod
     def backward(ctx, grad_output):
-        q, k, v, W_q, W_k = ctx.saved_tensors
+        q, k, v, W_q, W_k, core = ctx.saved_tensors
         causal = ctx.causal
-        
-        # Fall back to PyTorch autograd for backward
-        q = q.detach().requires_grad_(True)
-        k = k.detach().requires_grad_(True)
-        v = v.detach().requires_grad_(True)
-        W_q = W_q.detach().requires_grad_(True)
-        W_k = W_k.detach().requires_grad_(True)
-        
-        with torch.enable_grad():
-            # Recompute forward with autograd
-            B, H, T, D = q.shape
-            R = W_q.shape[-1]
-            
-            q_lr = torch.einsum("bhtd,hdr->bhtr", q, W_q)
-            k_lr = torch.einsum("bhtd,hdr->bhtr", k, W_k)
-            
-            scale = 1.0 / math.sqrt(max(R, 1))
-            scores = torch.einsum("bhir,bhjr->bhij", q_lr, k_lr) * scale
-            
-            if causal:
-                causal_mask = torch.triu(
-                    torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1
-                )
-                scores = scores.masked_fill(causal_mask, float("-inf"))
-            
-            attn = torch.softmax(scores, dim=-1)
-            out = torch.einsum("bhij,bhjd->bhid", attn, v)
-            
-            out.backward(grad_output)
-        
-        return q.grad, k.grad, v.grad, W_q.grad, W_k.grad, None
+        B, H, T, D = q.shape
+        R = W_q.shape[-1]
+        scale = 1.0 / math.sqrt(max(R, 1))
+
+        BH = B * H
+        head_idx = torch.arange(BH, device=q.device) % H
+
+        W_q_per = W_q[head_idx]
+        W_k_per = W_k[head_idx]
+        core_per = core[head_idx]
+
+        q_flat = q.reshape(BH, T, D)
+        k_flat = k.reshape(BH, T, D)
+        v_flat = v.reshape(BH, T, D)
+
+        q_lr = torch.bmm(q_flat, W_q_per)
+        k_lr = torch.bmm(k_flat, W_k_per)
+        scores = scale * torch.bmm(q_lr * core_per[:, None, :], k_lr.transpose(1, 2))
+
+        if causal:
+            causal_mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+        P = torch.softmax(scores, dim=-1)
+
+        go_flat = grad_output.reshape(BH, T, D)
+
+        dv_flat = torch.bmm(P.transpose(1, 2), go_flat)
+        dv = dv_flat.view(B, H, T, D).to(v.dtype)
+
+        dP_flat = torch.bmm(go_flat, v_flat.transpose(1, 2))
+        dp_sum = torch.sum(dP_flat * P, dim=-1, keepdim=True)
+        dscores_flat = P * (dP_flat - dp_sum)
+        if causal:
+            dscores_flat = dscores_flat.masked_fill(causal_mask, 0.0)
+
+        k_lr_scaled = k_lr * core_per[:, None, :]
+        dq_lr_flat = scale * torch.bmm(dscores_flat, k_lr_scaled)
+
+        q_lr_scaled = q_lr * core_per[:, None, :]
+        dk_lr_flat = scale * torch.bmm(dscores_flat.transpose(1, 2), q_lr_scaled)
+
+        tmp_core = torch.bmm(dscores_flat.transpose(1, 2), q_lr)
+        dcore_flat = scale * torch.sum(tmp_core * k_lr, dim=1)
+        dcore = dcore_flat.view(B, H, R).sum(dim=0)
+
+        dq_flat = torch.bmm(dq_lr_flat, W_q_per.transpose(1, 2))
+        dk_flat = torch.bmm(dk_lr_flat, W_k_per.transpose(1, 2))
+        dq = dq_flat.view(B, H, T, D).to(q.dtype)
+        dk = dk_flat.view(B, H, T, D).to(k.dtype)
+
+        dW_q_updates = torch.bmm(q_flat.transpose(1, 2), dq_lr_flat)
+        dW_k_updates = torch.bmm(k_flat.transpose(1, 2), dk_lr_flat)
+        dW_q = dW_q_updates.view(B, H, D, R).sum(dim=0)
+        dW_k = dW_k_updates.view(B, H, D, R).sum(dim=0)
+
+        return dq, dk, dv, dW_q.to(W_q.dtype), dW_k.to(W_k.dtype), dcore.to(core.dtype), None
 
 
-def lsr_attention_triton_autograd(q, k, v, W_q, W_k, causal=True):
-    """LSR attention with Triton forward and autograd backward."""
-    return LSRTritonFunction.apply(q, k, v, W_q, W_k, causal)
+class LsrTritonFactorFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, W_q, W_k, core1, core2, causal):
+        out = _run_fused_factorized(
+            q.float(), k.float(), v.float(),
+            W_q.float(), W_k.float(), core1.float(), core2.float(), causal,
+        )
+        ctx.save_for_backward(q, k, v, W_q, W_k, core1, core2)
+        ctx.causal = causal
+        return out.to(q.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        q, k, v, W_q, W_k, core1, core2 = ctx.saved_tensors
+        causal = ctx.causal
+        B, H, T, D = q.shape
+        R1 = core1.shape[-1]
+        R2 = core2.shape[-1]
+        R = R1 * R2
+        scale = 1.0 / math.sqrt(max(R, 1))
+
+        core_flat = torch.kron(core1, core2)  # (H, R)
+
+        q_lr = torch.einsum("bhtd,hdr->bhtr", q, W_q)
+        k_lr = torch.einsum("bhtd,hdr->bhtr", k, W_k)
+        scores = torch.einsum("bhir,hr,bhjr->bhij", q_lr, core_flat, k_lr) * scale
+        if causal:
+            causal_mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(causal_mask, float("-inf"))
+        P = torch.softmax(scores, dim=-1)
+
+        grad_output = grad_output.reshape(B, H, T, D)
+
+        dv = torch.einsum("bhij,bhid->bhjd", P, grad_output)
+        dP = torch.einsum("bhid,bhjd->bhij", grad_output, v)
+        dp_sum = torch.sum(dP * P, dim=-1, keepdim=True)
+        dscores = P * (dP - dp_sum)
+        if causal:
+            dscores = dscores.masked_fill(causal_mask, 0.0)
+
+        dq_lr = scale * torch.einsum("bhts,bhsr,hr->bhtr", dscores, k_lr, core_flat)
+        dk_lr = scale * torch.einsum("bhts,bhtr,hr->bhsr", dscores, q_lr, core_flat)
+        dcore_flat = scale * torch.einsum("bhts,bhtr,bhsr->hr", dscores, q_lr, k_lr)
+
+        dq = torch.einsum("bhtr,hdr->bhtd", dq_lr, W_q)
+        dk = torch.einsum("bhsr,hdr->bhsd", dk_lr, W_k)
+        dW_q = torch.einsum("bhtd,bhtr->hdr", q, dq_lr)
+        dW_k = torch.einsum("bhsd,bhsr->hdr", k, dk_lr)
+
+        dcore1 = dcore_flat.view(H, R1, R2).sum(dim=2)
+        dcore2 = dcore_flat.view(H, R1, R2).sum(dim=1)
+
+        return dq, dk, dv, dW_q.to(W_q.dtype), dW_k.to(W_k.dtype), dcore1.to(core1.dtype), dcore2.to(core2.dtype), None
 
 
 # -----------------------------------------------------------------------------
-# Module
+# Public API
 # -----------------------------------------------------------------------------
+
+def lsr_attention_triton(q, k, v, W_q, W_k, core, causal=True):
+    """LSR attention via fused Triton kernel with autograd."""
+    return LsrTritonFunction.apply(q, k, v, W_q, W_k, core, causal)
+
+
+def lsr_attention_triton_factorized(q, k, v, W_q, W_k, core1, core2, causal=True):
+    """LSR attention with factorized core via fused Triton kernel."""
+    return LsrTritonFactorFunction.apply(q, k, v, W_q, W_k, core1, core2, causal)
+
+# Backward-compatible alias
+lsr_attention_triton_fused = lsr_attention_triton
+
 
 class MultiHeadLSRAttentionTriton(nn.Module):
-    """
-    Multi-head LSR attention using Triton kernels.
-    
-    Args:
-        d_model: model dimension
-        num_heads: number of attention heads
-        lsr_rank: rank for LSR attention
-    """
-    
+    """Multi-head LSR attention using fused Triton kernels."""
+
     def __init__(self, d_model, num_heads, lsr_rank=32):
         super().__init__()
         assert d_model % num_heads == 0
-        
+
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
@@ -365,77 +492,15 @@ class MultiHeadLSRAttentionTriton(nn.Module):
         self.W_k_lsr = nn.Parameter(
             torch.randn(num_heads, self.d_head, lsr_rank) / math.sqrt(self.d_head)
         )
+        self.lsr_core = nn.Parameter(torch.ones(num_heads, lsr_rank))
 
     def forward(self, x):
         B, T, _ = x.shape
-
         q = self.q_proj(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.num_heads, self.d_head).transpose(1, 2)
 
-        y = lsr_attention_triton_autograd(q, k, v, self.W_q_lsr, self.W_k_lsr, causal=True)
+        y = lsr_attention_triton(q, k, v, self.W_q_lsr, self.W_k_lsr, self.lsr_core, causal=True)
 
         y = y.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.o_proj(y)
-
-
-# -----------------------------------------------------------------------------
-# Test
-# -----------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import time
-    
-    torch.manual_seed(42)
-    device = "cuda"
-    
-    B, H, T, D, R = 4, 8, 1024, 64, 32
-    
-    q = torch.randn(B, H, T, D, device=device, dtype=torch.float32)
-    k = torch.randn(B, H, T, D, device=device, dtype=torch.float32)
-    v = torch.randn(B, H, T, D, device=device, dtype=torch.float32)
-    W_q = torch.randn(H, D, R, device=device, dtype=torch.float32) / math.sqrt(D)
-    W_k = torch.randn(H, D, R, device=device, dtype=torch.float32) / math.sqrt(D)
-    
-    # Reference implementation
-    def lsr_reference(q, k, v, W_q, W_k):
-        q_lr = torch.einsum("bhtd,hdr->bhtr", q, W_q)
-        k_lr = torch.einsum("bhtd,hdr->bhtr", k, W_k)
-        scores = torch.einsum("bhir,bhjr->bhij", q_lr, k_lr) / math.sqrt(R)
-        causal_mask = torch.triu(torch.ones(T, T, device=q.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal_mask, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)
-        return torch.einsum("bhij,bhjd->bhid", attn, v)
-    
-    # Warmup
-    for _ in range(3):
-        _ = lsr_attention_triton(q, k, v, W_q, W_k, causal=True)
-        _ = lsr_reference(q, k, v, W_q, W_k)
-    torch.cuda.synchronize()
-    
-    # Correctness
-    out_triton = lsr_attention_triton(q, k, v, W_q, W_k, causal=True)
-    out_ref = lsr_reference(q, k, v, W_q, W_k)
-    print(f"Max diff: {(out_triton - out_ref).abs().max().item():.6f}")
-    
-    # Benchmark
-    iters = 50
-    
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for _ in range(iters):
-        _ = lsr_attention_triton(q, k, v, W_q, W_k, causal=True)
-    torch.cuda.synchronize()
-    triton_time = (time.time() - t0) / iters * 1000
-    
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for _ in range(iters):
-        _ = lsr_reference(q, k, v, W_q, W_k)
-    torch.cuda.synchronize()
-    ref_time = (time.time() - t0) / iters * 1000
-    
-    print(f"Triton LSR: {triton_time:.2f} ms")
-    print(f"PyTorch LSR: {ref_time:.2f} ms")
-    print(f"Speedup: {ref_time/triton_time:.2f}x")
-
