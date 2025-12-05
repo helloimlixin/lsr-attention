@@ -1,7 +1,13 @@
+
 """
 Minimal GPT implementation with an optional Kronecker-factored linear path.
 All LSR-related code paths have been removed.
 """
+
+# Ensure extensions/ is in sys.path for CUDA extension import
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "extensions"))
 
 import math
 import argparse
@@ -219,46 +225,30 @@ class KroneckerLinear(nn.Module):
         *prefix, feat = x.shape
         assert feat == self.in_features, f"Expected last dim {self.in_features}, got {feat}"
 
-        # Inference: always use cached dense weight for best latency; training paths ignore
-        # kron_cuda_fused/triton flags now.
-        if not self.training:
-            W = self.materialize_dense(x.device, x.dtype)
-            x2d = x.view(-1, feat)
-            out = torch.matmul(x2d, W.t())
-            if self.bias is not None:
-                out = out + self.bias
-            return out.view(*prefix, self.out_features)
+        # Use explicit batched matmul for speed
+        B = x.shape[0] if x.ndim == 2 else x.shape[0] * x.shape[1]
+        hd = self.head_dim
+        R = self.rank
+        In = self.in_mult * self.heads
+        Out = self.out_mult * self.heads
 
-        # Training: bypass fused/triton to use simpler einsum path for stability and speed.
+        x_flat = x.reshape(-1, hd, In)  # (B, Dh, In)
+        # First contraction: (B, Dh, In) x (R, In, Out) -> (B, R, Dh, Out)
+        # We do this by expanding x and using bmm
+        x_exp = x_flat.unsqueeze(1).expand(-1, R, -1, -1).reshape(-1, hd, In)  # (B*R, Dh, In)
+        A_exp = self.A.reshape(R, Out, In).expand(B, -1, -1, -1).reshape(-1, Out, In)  # (B*R, Out, In)
+        mid = torch.bmm(x_exp, A_exp.transpose(1, 2))  # (B*R, Dh, Out)
+        mid = mid.view(B, R, hd, Out)  # (B, R, Dh, Out)
 
-        x_flat = x.reshape(-1, self.head_dim, self.in_mult * self.heads)
+        # Second contraction: (B, R, Dh, Out) x (R, Dh, Dh) -> (B, R, Dh, Out)
+        # For each rank, do bmm over Dh
+        B_exp = self.B.unsqueeze(0).expand(B, -1, -1, -1).reshape(-1, hd, hd)  # (B*R, Dh, Dh)
+        mid2 = mid.permute(0,1,3,2).reshape(-1, Out, hd)  # (B*R, Out, Dh)
+        y = torch.bmm(mid2, B_exp.transpose(1,2))  # (B*R, Out, Dh)
+        y = y.view(B, R, Out, hd).permute(0,1,3,2)  # (B, R, Dh, Out)
 
-        use_fused = False  # force simple path for training speed/stability
-        if use_fused:
-            # Reshape to batch*rank and use batched matmuls to better hit cublas/tensor cores.
-            # mid = x @ A^T
-            xr = x_flat.unsqueeze(1).expand(-1, self.rank, -1, -1)  # (B, R, Dh, In)
-            xr = xr.reshape(-1, self.head_dim, self.in_mult * self.heads)  # (B*R, Dh, In)
-            At = self.A.transpose(-1, -2).contiguous()  # (R, In, Out)
-            At_exp = At.unsqueeze(0).expand(x_flat.size(0), -1, -1, -1).reshape(-1, self.in_mult * self.heads, self.out_mult * self.heads)
-            mid = torch.bmm(xr, At_exp)  # (B*R, Dh, Out)
-            mid = mid.view(-1, self.rank, self.head_dim, self.out_mult * self.heads)  # (B, R, Dh, Out)
-
-            # y = B @ mid for each rank
-            Br = self.B.reshape(self.rank, self.head_dim, self.head_dim)
-            Br_exp = Br.unsqueeze(0).expand(mid.size(0), -1, -1, -1).reshape(-1, self.head_dim, self.head_dim)  # (B*R, Dh, Dh)
-            mid_t = mid.permute(0, 1, 3, 2).reshape(-1, self.out_mult * self.heads, self.head_dim)  # (B*R, Out, Dh)
-            y = torch.bmm(mid_t, Br_exp.transpose(-1, -2))  # (B*R, Out, Dh)
-            y = y.view(-1, self.rank, self.out_mult * self.heads, self.head_dim).permute(0, 1, 3, 2)  # (B, R, Dh, Out)
-            acc = y.sum(dim=1)  # sum over rank -> (B, Dh, Out)
-        else:
-            # Fuse rank dimension via einsum to reduce Python overhead and kernel launches.
-            # mid: (batch, head_dim, rank, out_mult * heads)
-            mid = torch.einsum("bdi,roi->bdro", x_flat, self.A)
-            # y: (batch, head_dim, rank, out_mult * heads)
-            y = torch.einsum("rde,bdro->bero", self.B, mid)
-            acc = y.sum(dim=2)  # sum over rank
-
+        # Sum over rank
+        acc = y.sum(dim=1)  # (B, Dh, Out)
         out = acc.transpose(1, 2).contiguous().view(-1, self.out_features)
         if self.bias is not None:
             out = out + self.bias
@@ -269,20 +259,40 @@ class KroneckerLinear(nn.Module):
         if self._cached_dense is not None and self._cached_device == device and self._cached_dtype == dtype:
             return self._cached_dense
 
-        # Build dense weight: sum_r kron(A_r, B_r)
-        # A_r: (out_mult * heads, in_mult * heads)
-        # B_r: (head_dim, head_dim)
+        # Build dense weight: sum_r block-wise Hadamard product matching einsum path
         weight = torch.zeros(self.out_features, self.in_features, device=device, dtype=dtype)
+        hd = self.head_dim
+        OM = self.out_mult * self.heads
+        IM = self.in_mult * self.heads
         for r in range(self.rank):
             Ar = self.A[r].to(device=device, dtype=dtype)
             Br = self.B[r].to(device=device, dtype=dtype)
-            kron = torch.kron(Ar, Br)
-            weight += kron
+            # Block-wise Hadamard: W[i*hd:(i+1)*hd, j*hd:(j+1)*hd] = Br * Ar[i, j]
+            for i in range(OM):
+                for j in range(IM):
+                    weight[i*hd:(i+1)*hd, j*hd:(j+1)*hd] += Br * Ar[i, j]
 
         self._cached_dense = weight
         self._cached_device = device
         self._cached_dtype = dtype
         return weight
+
+    def test_materialize_dense(self):
+        # Test that materialize_dense matches einsum path for random input
+        x = torch.randn(2, self.in_features, device=self.A.device, dtype=self.A.dtype)
+        # Einsum path
+        x_flat = x.reshape(-1, self.head_dim, self.in_mult * self.heads)
+        mid = torch.einsum("bdi,roi->bdro", x_flat, self.A)
+        y = torch.einsum("rde,bdro->bero", self.B, mid)
+        acc = y.sum(dim=2)
+        out_einsum = acc.transpose(1, 2).contiguous().view(-1, self.out_features)
+        # Dense path
+        W = self.materialize_dense(self.A.device, self.A.dtype)
+        out_dense = torch.matmul(x, W.t())
+        # Compare
+        max_diff = (out_einsum - out_dense).abs().max().item()
+        print(f"[Debug] KroneckerLinear materialize_dense max diff: {max_diff}")
+        return max_diff
 
 
 class CausalSelfAttention(nn.Module):
@@ -650,6 +660,15 @@ def accelerate_train(
             'config': config,
         }, 'checkpoint.pt')
         print("[Accelerate] Checkpoint saved to checkpoint.pt")
+
+        # After training, test KroneckerLinear materialize_dense if using Kronecker
+        if config.use_kron:
+            base_model = accelerator.unwrap_model(model)
+            print("[Debug] Testing KroneckerLinear materialize_dense consistency...")
+            for name, module in base_model.named_modules():
+                if isinstance(module, KroneckerLinear):
+                    max_diff = module.test_materialize_dense()
+                    print(f"[Debug] {name}: max diff = {max_diff}")
 
 
 def compare_kron_variants(base_config: GPTConfig, device: torch.device, batch_size: int, steps: int, gen_tokens: int, tokens: Optional[torch.Tensor] = None):
