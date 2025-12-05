@@ -1,16 +1,143 @@
 """
-Minimal GPT implementation with standard dot-product attention only.
+Minimal GPT implementation with an optional Kronecker-factored linear path.
 All LSR-related code paths have been removed.
 """
 
 import math
 import argparse
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
+
+try:
+    from accelerate import Accelerator
+except Exception:  # noqa: BLE001
+    Accelerator = None
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # noqa: BLE001
+    tqdm = None
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from data import make_batch, load_shakespeare
+
+# Optional Triton for inference-only matmul
+# Optional Triton for inference-only matmul
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except Exception:  # noqa: BLE001
+    _HAS_TRITON = False
+
+# Optional fused CUDA extension (will be a separate build)
+try:
+    import kron_fused  # type: ignore
+
+    _HAS_KRON_FUSED = True
+except Exception:  # noqa: BLE001
+    kron_fused = None
+    _HAS_KRON_FUSED = False
+
+
+if _HAS_TRITON:
+    @triton.jit
+    def _matmul_kernel(
+        A_ptr, B_ptr, C_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+        k_iter = tl.cdiv(K, BLOCK_K)
+        for i in range(0, k_iter):
+            k_start = i * BLOCK_K
+            k_idx = k_start + offs_k
+            a_mask = (offs_m[:, None] < M) & (k_idx[None, :] < K)
+            b_mask = (k_idx[:, None] < K) & (offs_n[None, :] < N)
+            A = tl.load(A_ptr + offs_m[:, None] * stride_am + k_idx[None, :] * stride_ak, mask=a_mask, other=0.0)
+            B = tl.load(B_ptr + k_idx[:, None] * stride_bk + offs_n[None, :] * stride_bn, mask=b_mask, other=0.0)
+            acc += tl.dot(A, B)
+
+        acc = acc.to(tl.float16)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        tl.store(C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=c_mask)
+
+
+    def triton_matmul_fixed(a: torch.Tensor, b: torch.Tensor, block_m: int = 128, block_n: int = 128, block_k: int = 32) -> torch.Tensor:
+        # a: (M, K), b: (N, K) transposed; we want a @ b.T
+        assert a.is_cuda and b.is_cuda, "Triton matmul requires CUDA tensors"
+        M, K = a.shape
+        N = b.shape[0]
+        # Strides assume row-major for a, row-major for b (b is already transposed weight)
+        c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+        grid = (triton.cdiv(M, block_m), triton.cdiv(N, block_n))
+        _matmul_kernel[grid](
+            a, b,
+            c,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(1), b.stride(0),
+            c.stride(0), c.stride(1),
+            BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k,
+        )
+        return c
+
+
+class KronTritonFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x2d: torch.Tensor, W: torch.Tensor, bias: Optional[torch.Tensor]):
+        # x2d: (B*, in_features); W: (out_features, in_features)
+        out = triton_matmul_fixed(x2d, W)
+        ctx.save_for_backward(x2d, W, bias)
+        return out if bias is None else out + bias
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        x2d, W, bias = ctx.saved_tensors
+        grad_x = grad_w = grad_b = None
+        if ctx.needs_input_grad[0]:
+            grad_x = grad_out @ W
+        if ctx.needs_input_grad[1]:
+            grad_w = grad_out.t() @ x2d
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_b = grad_out.sum(dim=0)
+        return grad_x, grad_w, grad_b
+
+
+class KronCudaFusedFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x2d: torch.Tensor, A: torch.Tensor, B: torch.Tensor, bias: Optional[torch.Tensor], heads: int, head_dim: int, in_mult: int, out_mult: int):
+        if not _HAS_KRON_FUSED:
+            raise RuntimeError("kron_fused extension not available")
+        # Expect x2d: (B*, in_features), A: (rank, out_mult*heads, in_mult*heads), B: (rank, head_dim, head_dim)
+        y = kron_fused.forward(x2d, A, B, heads, head_dim, in_mult, out_mult)
+        ctx.save_for_backward(x2d, A, B, bias)
+        ctx.meta = (heads, head_dim, in_mult, out_mult)
+        return y if bias is None else y + bias
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        if not _HAS_KRON_FUSED:
+            raise RuntimeError("kron_fused extension not available")
+        x2d, A, B, bias = ctx.saved_tensors
+        heads, head_dim, in_mult, out_mult = ctx.meta
+        grad_x, grad_A, grad_B = kron_fused.backward(grad_out.contiguous(), x2d, A, B, heads, head_dim, in_mult, out_mult)
+        grad_bias = grad_out.sum(dim=0) if (bias is not None and ctx.needs_input_grad[3]) else None
+        return grad_x, grad_A, grad_B, grad_bias, None, None, None, None
 
 
 @dataclass
@@ -22,6 +149,140 @@ class GPTConfig:
     n_embd: int = 128
     dropout: float = 0.0
     bias: bool = False
+    use_kron: bool = False
+    kron_rank: int = 1
+    kron_infer_dense: bool = False
+    kron_fused: bool = False
+    kron_triton_infer: bool = False
+    kron_triton_autograd: bool = False
+    kron_cuda_fused: bool = False
+
+
+class KroneckerLinear(nn.Module):
+    r"""Linear layer using a small Kronecker factorization.
+
+    The weight matrix W is represented as the sum of rank Kronecker products:
+    W = \sum_r (A_r \otimes B_r). We choose factor shapes to map between
+    feature dimensions built from (n_head, head_dim) pairs, which keeps each
+    factor small and CUDA-friendly.
+    """
+
+    def __init__(
+        self,
+        heads: int,
+        head_dim: int,
+        in_mult: int = 1,
+        out_mult: int = 1,
+        rank: int = 1,
+        bias: bool = False,
+        infer_dense: bool = False,
+        fused: bool = False,
+        triton_infer: bool = False,
+        triton_autograd: bool = False,
+        cuda_fused: bool = False,
+    ):
+        super().__init__()
+        self.heads = heads
+        self.head_dim = head_dim
+        self.in_mult = in_mult
+        self.out_mult = out_mult
+        self.rank = rank
+        self.infer_dense = infer_dense
+        self.fused = fused
+        self.triton_infer = triton_infer and _HAS_TRITON
+        self.triton_autograd = triton_autograd and _HAS_TRITON
+        self.cuda_fused = cuda_fused and _HAS_KRON_FUSED
+
+        self.in_features = heads * head_dim * in_mult
+        self.out_features = heads * head_dim * out_mult
+
+        self.A = nn.Parameter(torch.empty(rank, out_mult * heads, in_mult * heads))
+        self.B = nn.Parameter(torch.empty(rank, head_dim, head_dim))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(self.out_features))
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+        self._cached_dense = None
+        self._cached_device = None
+        self._cached_dtype = None
+
+    def reset_parameters(self):
+        for r in range(self.rank):
+            nn.init.normal_(self.A[r], mean=0.0, std=0.02)
+            nn.init.normal_(self.B[r], mean=0.0, std=0.02)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        *prefix, feat = x.shape
+        assert feat == self.in_features, f"Expected last dim {self.in_features}, got {feat}"
+
+        # Inference: always use cached dense weight for best latency; training paths ignore
+        # kron_cuda_fused/triton flags now.
+        if not self.training:
+            W = self.materialize_dense(x.device, x.dtype)
+            x2d = x.view(-1, feat)
+            out = torch.matmul(x2d, W.t())
+            if self.bias is not None:
+                out = out + self.bias
+            return out.view(*prefix, self.out_features)
+
+        # Training: bypass fused/triton to use simpler einsum path for stability and speed.
+
+        x_flat = x.reshape(-1, self.head_dim, self.in_mult * self.heads)
+
+        use_fused = False  # force simple path for training speed/stability
+        if use_fused:
+            # Reshape to batch*rank and use batched matmuls to better hit cublas/tensor cores.
+            # mid = x @ A^T
+            xr = x_flat.unsqueeze(1).expand(-1, self.rank, -1, -1)  # (B, R, Dh, In)
+            xr = xr.reshape(-1, self.head_dim, self.in_mult * self.heads)  # (B*R, Dh, In)
+            At = self.A.transpose(-1, -2).contiguous()  # (R, In, Out)
+            At_exp = At.unsqueeze(0).expand(x_flat.size(0), -1, -1, -1).reshape(-1, self.in_mult * self.heads, self.out_mult * self.heads)
+            mid = torch.bmm(xr, At_exp)  # (B*R, Dh, Out)
+            mid = mid.view(-1, self.rank, self.head_dim, self.out_mult * self.heads)  # (B, R, Dh, Out)
+
+            # y = B @ mid for each rank
+            Br = self.B.reshape(self.rank, self.head_dim, self.head_dim)
+            Br_exp = Br.unsqueeze(0).expand(mid.size(0), -1, -1, -1).reshape(-1, self.head_dim, self.head_dim)  # (B*R, Dh, Dh)
+            mid_t = mid.permute(0, 1, 3, 2).reshape(-1, self.out_mult * self.heads, self.head_dim)  # (B*R, Out, Dh)
+            y = torch.bmm(mid_t, Br_exp.transpose(-1, -2))  # (B*R, Out, Dh)
+            y = y.view(-1, self.rank, self.out_mult * self.heads, self.head_dim).permute(0, 1, 3, 2)  # (B, R, Dh, Out)
+            acc = y.sum(dim=1)  # sum over rank -> (B, Dh, Out)
+        else:
+            # Fuse rank dimension via einsum to reduce Python overhead and kernel launches.
+            # mid: (batch, head_dim, rank, out_mult * heads)
+            mid = torch.einsum("bdi,roi->bdro", x_flat, self.A)
+            # y: (batch, head_dim, rank, out_mult * heads)
+            y = torch.einsum("rde,bdro->bero", self.B, mid)
+            acc = y.sum(dim=2)  # sum over rank
+
+        out = acc.transpose(1, 2).contiguous().view(-1, self.out_features)
+        if self.bias is not None:
+            out = out + self.bias
+        return out.view(*prefix, self.out_features)
+
+    @torch.no_grad()
+    def materialize_dense(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self._cached_dense is not None and self._cached_device == device and self._cached_dtype == dtype:
+            return self._cached_dense
+
+        # Build dense weight: sum_r kron(A_r, B_r)
+        # A_r: (out_mult * heads, in_mult * heads)
+        # B_r: (head_dim, head_dim)
+        weight = torch.zeros(self.out_features, self.in_features, device=device, dtype=dtype)
+        for r in range(self.rank):
+            Ar = self.A[r].to(device=device, dtype=dtype)
+            Br = self.B[r].to(device=device, dtype=dtype)
+            kron = torch.kron(Ar, Br)
+            weight += kron
+
+        self._cached_dense = weight
+        self._cached_device = device
+        self._cached_dtype = dtype
+        return weight
 
 
 class CausalSelfAttention(nn.Module):
@@ -30,8 +291,34 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.head_dim = config.n_embd // config.n_head
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        if config.use_kron:
+            self.c_attn = KroneckerLinear(
+                config.n_head,
+                self.head_dim,
+                out_mult=3,
+                in_mult=1,
+                rank=config.kron_rank,
+                bias=config.bias,
+                infer_dense=config.kron_infer_dense,
+                fused=config.kron_fused,
+                triton_infer=config.kron_triton_infer,
+                cuda_fused=config.kron_cuda_fused,
+            )
+            self.c_proj = KroneckerLinear(
+                config.n_head,
+                self.head_dim,
+                out_mult=1,
+                in_mult=1,
+                rank=config.kron_rank,
+                bias=config.bias,
+                infer_dense=config.kron_infer_dense,
+                fused=config.kron_fused,
+                triton_infer=config.kron_triton_infer,
+                cuda_fused=config.kron_cuda_fused,
+            )
+        else:
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
@@ -61,8 +348,34 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        if config.use_kron:
+            self.c_fc = KroneckerLinear(
+                config.n_head,
+                config.n_embd // config.n_head,
+                out_mult=4,
+                in_mult=1,
+                rank=config.kron_rank,
+                bias=config.bias,
+                infer_dense=config.kron_infer_dense,
+                fused=config.kron_fused,
+                triton_infer=config.kron_triton_infer,
+                cuda_fused=config.kron_cuda_fused,
+            )
+            self.c_proj = KroneckerLinear(
+                config.n_head,
+                config.n_embd // config.n_head,
+                out_mult=1,
+                in_mult=4,
+                rank=config.kron_rank,
+                bias=config.bias,
+                infer_dense=config.kron_infer_dense,
+                fused=config.kron_fused,
+                triton_infer=config.kron_triton_infer,
+                cuda_fused=config.kron_cuda_fused,
+            )
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -110,6 +423,8 @@ class GPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
+        elif isinstance(module, KroneckerLinear):
+            module.reset_parameters()
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -147,27 +462,201 @@ class GPT(nn.Module):
         return idx
 
 
-def get_batch(block_size: int, device: torch.device):
-    data = torch.randint(0, 1000, (10000,), device=device)
-    ix = torch.randint(len(data) - block_size, (32,), device=device)
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + 1 + block_size] for i in ix])
-    return x, y
+def get_batch(block_size: int, device: torch.device, batch_size: int, tokens: Optional[torch.Tensor] = None):
+    if tokens is None:
+        data = torch.randint(0, 1000, (10000,), device=device)
+        ix = torch.randint(len(data) - block_size, (batch_size,), device=device)
+        x = torch.stack([data[i : i + block_size] for i in ix])
+        y = torch.stack([data[i + 1 : i + 1 + block_size] for i in ix])
+        return x, y
+    return make_batch(tokens, batch_size, block_size, device)
 
 
-def train(config: GPTConfig, device: torch.device):
+def train(config: GPTConfig, device: torch.device, max_iters: int = 50, eval_interval: int = 10, batch_size: int = 32, tokens: Optional[torch.Tensor] = None):
     model = GPT(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
 
     model.train()
-    for step in range(50):
-        xb, yb = get_batch(config.block_size, device)
+    for step in range(max_iters):
+        xb, yb = get_batch(config.block_size, device, batch_size, tokens)
         optimizer.zero_grad(set_to_none=True)
         _, loss = model(xb, yb)
         loss.backward()
         optimizer.step()
-        if step % 10 == 0:
+        if step % eval_interval == 0:
             print(f"step {step}: loss {loss.item():.4f}")
+
+
+def _sync_if_cuda(device: torch.device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def benchmark_variant(config: GPTConfig, device: torch.device, batch_size: int, steps: int, gen_tokens: int, tokens: Optional[torch.Tensor] = None):
+    model = GPT(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+
+    train_times = []
+    last_loss = 0.0
+    model.train()
+    for _ in range(steps):
+        xb, yb = get_batch(config.block_size, device, batch_size, tokens)
+        optimizer.zero_grad(set_to_none=True)
+        t0 = time.perf_counter()
+        _, loss = model(xb, yb)
+        loss.backward()
+        optimizer.step()
+        _sync_if_cuda(device)
+        train_times.append(time.perf_counter() - t0)
+        last_loss = loss.item()
+
+    avg_train = sum(train_times) / len(train_times)
+    tokens_per_step = batch_size * config.block_size
+    train_tps = tokens_per_step / avg_train
+
+    model.eval()
+    # Warm materialized dense weights for inference path to avoid first-call penalty.
+    param_dtype = next(model.parameters()).dtype
+    for m in model.modules():
+        if isinstance(m, KroneckerLinear) and m.infer_dense:
+            m.materialize_dense(device, param_dtype)
+
+    with torch.no_grad():
+        xb, _ = get_batch(config.block_size, device, batch_size, tokens)
+        t1 = time.perf_counter()
+        _ = model(xb)
+        _sync_if_cuda(device)
+        fwd_time = time.perf_counter() - t1
+
+        t2 = time.perf_counter()
+        _ = model.generate(xb[:1], max_new_tokens=gen_tokens)
+        _sync_if_cuda(device)
+        gen_time = time.perf_counter() - t2
+
+    return {
+        "train_ms": avg_train * 1000.0,
+        "train_tps": train_tps,
+        "loss": last_loss,
+        "fwd_ms": fwd_time * 1000.0,
+        "gen_ms": gen_time * 1000.0,
+    }
+
+
+def _decode_tokens(tokenizer, tokens: torch.Tensor) -> str:
+    if tokenizer is None:
+        return "[no tokenizer available]"
+    return tokenizer.decode(tokens.tolist(), skip_special_tokens=True)
+
+
+def accelerate_train(
+    config: GPTConfig,
+    batch_size: int,
+    steps: int,
+    dataset: str,
+    sample_after: bool,
+    sample_tokens: int,
+    sample_prompt: str,
+    text_path: Optional[str] = None,
+):
+    if config.use_kron:
+        print("[Accelerate] Using Kronecker model (kron_*)")
+    else:
+        print("[Accelerate] Using baseline model (standard Linear)")
+    # ...existing code continues...
+
+    accelerator = Accelerator()
+    device = accelerator.device
+
+    tokens = None
+    tokenizer = None
+    if dataset == "shakespeare":
+        tokenizer, train_ids, _ = load_shakespeare(text_path=text_path)
+        tokens = train_ids.to(device)
+
+    model = GPT(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.1)
+    model, optimizer = accelerator.prepare(model, optimizer)
+
+    train_times = []
+    last_loss = 0.0
+
+    model.train()
+    pbar = tqdm(range(steps), disable=not accelerator.is_local_main_process)
+    for _ in pbar:
+        xb, yb = get_batch(config.block_size, device, batch_size, tokens)
+        optimizer.zero_grad(set_to_none=True)
+        t0 = time.perf_counter()
+        _, loss = model(xb, yb)
+        accelerator.backward(loss)
+        optimizer.step()
+        accelerator.wait_for_everyone()
+        t1 = time.perf_counter()
+        train_times.append(t1 - t0)
+        last_loss = loss.item()
+        if accelerator.is_local_main_process:
+            pbar.set_postfix({"loss": f"{last_loss:.4f}"})
+    accelerator.wait_for_everyone()
+
+    # Compute throughput on main process
+    if accelerator.is_local_main_process:
+        avg_train = sum(train_times) / len(train_times)
+        tokens_per_step = batch_size * config.block_size
+        train_tps = tokens_per_step / avg_train
+        print(f"[Accelerate] train avg: {avg_train*1000:.2f} ms/step | tokens/s: {train_tps:.1f} | loss: {last_loss:.4f}")
+
+    if sample_after:
+        if accelerator.is_local_main_process:
+            base_model = accelerator.unwrap_model(model)
+            base_model.eval()
+            with torch.no_grad():
+                if tokenizer is not None:
+                    prompt_ids = tokenizer(sample_prompt, return_tensors="pt").input_ids.to(device)
+                else:
+                    prompt_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
+
+                # Forward latency (single batch)
+                t_fwd0 = time.perf_counter()
+                _ = base_model(prompt_ids)
+                t_fwd1 = time.perf_counter()
+
+                # Generation timing with tqdm progress bar
+                t_gen0 = time.perf_counter()
+                gen_ids = prompt_ids.clone()
+                for _ in tqdm(range(sample_tokens), desc="Generating", ncols=80):
+                    gen_ids = base_model.generate(gen_ids, max_new_tokens=1)
+                t_gen1 = time.perf_counter()
+
+                fwd_ms = (t_fwd1 - t_fwd0) * 1000.0
+                gen_ms = (t_gen1 - t_gen0) * 1000.0
+                print(f"[Accelerate] fwd: {fwd_ms:.2f} ms | gen({sample_tokens}): {gen_ms:.2f} ms")
+
+                if tokenizer is not None:
+                    text = _decode_tokens(tokenizer, gen_ids[0])
+                    print("\n[Sample]\n", text)
+                else:
+                    print("\n[Sample token ids]\n", gen_ids[0].tolist())
+        accelerator.wait_for_everyone()
+
+    # Save checkpoint on main process after training
+    if accelerator.is_local_main_process:
+        torch.save({
+            'model_state_dict': accelerator.unwrap_model(model).state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': config,
+        }, 'checkpoint.pt')
+        print("[Accelerate] Checkpoint saved to checkpoint.pt")
+
+
+def compare_kron_variants(base_config: GPTConfig, device: torch.device, batch_size: int, steps: int, gen_tokens: int, tokens: Optional[torch.Tensor] = None):
+    variants = [("baseline", False), ("kron", True)]
+    for name, use_kron in variants:
+        cfg = replace(base_config, use_kron=use_kron)
+        res = benchmark_variant(cfg, device, batch_size=batch_size, steps=steps, gen_tokens=gen_tokens, tokens=tokens)
+        print(f"=== {name} ===")
+        print(
+            f"train avg: {res['train_ms']:.2f} ms/step | tokens/s: {res['train_tps']:.1f} | loss: {res['loss']:.4f}"
+        )
+        print(f"fwd: {res['fwd_ms']:.2f} ms | gen({gen_tokens}): {res['gen_ms']:.2f} ms")
 
 
 def main():
@@ -180,8 +669,30 @@ def main():
     parser.add_argument("--n_embd", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--bias", action="store_true")
+    parser.add_argument("--max_iters", type=int, default=50)
+    parser.add_argument("--eval_interval", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--compare_kron", action="store_true", help="Benchmark baseline vs Kronecker variants")
+    parser.add_argument("--bench_steps", type=int, default=20, help="Number of steps for benchmark mode")
+    parser.add_argument("--bench_gen_tokens", type=int, default=64, help="Generation length to time in benchmark mode")
+    parser.add_argument("--use_kron", action="store_true", help="Use Kronecker-factored linears for attention/MLP")
+    parser.add_argument("--kron_rank", type=int, default=1, help="Number of Kronecker factors to sum")
+    parser.add_argument("--kron_infer_dense", action="store_true", help="Materialize dense weight at inference for single GEMM")
+    parser.add_argument("--kron_fused", action="store_true", help="Use batched matmul fused path for Kronecker forward")
+    parser.add_argument("--kron_triton_infer", action="store_true", help="Use Triton matmul on dense weight for inference-only path")
+    parser.add_argument("--kron_triton_autograd", action="store_true", help="Use Triton matmul forward with torch backward (dense weight)")
+    parser.add_argument("--kron_cuda_fused", action="store_true", help="Use CUDA extension fused forward/backward if built")
+    parser.add_argument("--dataset", type=str, default="random", choices=["random", "shakespeare"], help="Training data source")
+    parser.add_argument("--accelerate", action="store_true", help="Use HuggingFace Accelerate for multi-GPU training")
+    parser.add_argument("--accelerate_steps", type=int, default=100, help="Number of steps when using Accelerate")
+    parser.add_argument("--sample_after", action="store_true", help="After training, generate a sample")
+    parser.add_argument("--sample_tokens", type=int, default=100, help="Number of new tokens to generate in the sample")
+    parser.add_argument("--sample_prompt", type=str, default="To be, or not to be", help="Prompt text for sampling")
+    parser.add_argument("--text_path", type=str, default=None, help="Path to local Shakespeare text (e.g., inputs.txt)")
     args = parser.parse_args()
-
+    # If any kron_* flag is set, or --use_kron is passed, use_kron should be True
+    kron_flags = [args.kron_fused, args.kron_triton_infer, args.kron_triton_autograd, args.kron_cuda_fused]
+    use_kron = args.use_kron or any(kron_flags)
     config = GPTConfig(
         block_size=args.block_size,
         vocab_size=args.vocab_size,
@@ -190,10 +701,33 @@ def main():
         n_embd=args.n_embd,
         dropout=args.dropout,
         bias=args.bias,
+        use_kron=use_kron,
+        kron_rank=args.kron_rank,
+        kron_infer_dense=args.kron_infer_dense,
+        kron_fused=args.kron_fused,
+        kron_triton_infer=args.kron_triton_infer,
+        kron_triton_autograd=args.kron_triton_autograd,
+        kron_cuda_fused=args.kron_cuda_fused,
     )
 
-    device = torch.device(args.device)
-    train(config, device)
+    if args.accelerate:
+        accelerate_train(
+            config,
+            batch_size=args.batch_size,
+            steps=args.accelerate_steps,
+            dataset=args.dataset,
+            sample_after=args.sample_after,
+            sample_tokens=args.sample_tokens,
+            sample_prompt=args.sample_prompt,
+            text_path=args.text_path,
+        )
+    else:
+        device = torch.device(args.device)
+        tokens = None
+        if args.dataset == "shakespeare":
+            _, train_ids, _ = load_shakespeare(text_path=args.text_path)
+            tokens = train_ids.to(device)
+        train(config, device, max_iters=args.max_iters, eval_interval=args.eval_interval, batch_size=args.batch_size, tokens=tokens)
 
 
 if __name__ == "__main__":
