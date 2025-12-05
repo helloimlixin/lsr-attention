@@ -614,6 +614,11 @@ def accelerate_train(
                 else:
                     prompt_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
 
+                # Debug: print prompt token ids and decoded prompt
+                print("[Debug] Prompt token ids:", prompt_ids[0].tolist())
+                if tokenizer is not None:
+                    decoded_prompt = tokenizer.decode(prompt_ids[0])
+                    print("[Debug] Decoded prompt:", decoded_prompt)
                 # Forward latency (single batch)
                 t_fwd0 = time.perf_counter()
                 _ = base_model(prompt_ids)
